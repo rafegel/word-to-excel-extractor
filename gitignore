@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.env
+*.xlsx
+*.docx
+!ornek_calisanlar.docx
+.DS_Store
+venv/
+.venv/
