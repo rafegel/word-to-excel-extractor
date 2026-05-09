@@ -1,102 +1,105 @@
 #!/usr/bin/env python3
 """
-Word → Excel Veri Çıkarıcı
-Groq AI kullanarak Word dosyasından istenen verileri çıkarır ve Excel'e yazar.
+Word/PDF → Excel Veri Çıkarıcı
+Tkinter GUI + Watchdog klasör izleme + Groq AI + PDF desteği
 """
 
 import sys
 import json
 import re
-import argparse
+import threading
 from pathlib import Path
+from datetime import datetime
+
+import tkinter as tk
+from tkinter import ttk, filedialog, scrolledtext, messagebox
 
 from docx import Document
 from groq import Groq
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
+try:
+    import PyPDF2
+    PDF_DESTEKLI = True
+except ImportError:
+    PDF_DESTEKLI = False
+
+
+# ─── Dosya Okuma ─────────────────────────────────────────────────────────────
 
 def word_oku(dosya_yolu: str) -> str:
-    """Word dosyasından tüm metni çıkarır."""
     doc = Document(dosya_yolu)
     satirlar = []
-
     for paragraf in doc.paragraphs:
         if paragraf.text.strip():
             satirlar.append(paragraf.text.strip())
-
     for tablo in doc.tables:
         for satir in tablo.rows:
-            hucre_metinleri = [h.text.strip() for h in satir.cells if h.text.strip()]
-            if hucre_metinleri:
-                satirlar.append(" | ".join(hucre_metinleri))
-
+            hucreler = [h.text.strip() for h in satir.cells if h.text.strip()]
+            if hucreler:
+                satirlar.append(" | ".join(hucreler))
     return "\n".join(satirlar)
 
 
+def pdf_oku(dosya_yolu: str) -> str:
+    if not PDF_DESTEKLI:
+        return ""
+    with open(dosya_yolu, "rb") as f:
+        reader = PyPDF2.PdfReader(f)
+        return "\n".join(
+            page.extract_text() for page in reader.pages if page.extract_text()
+        )
+
+
+def dosya_oku(dosya_yolu: str) -> str:
+    yol = Path(dosya_yolu)
+    if yol.suffix.lower() == ".docx":
+        return word_oku(dosya_yolu)
+    elif yol.suffix.lower() == ".pdf":
+        return pdf_oku(dosya_yolu)
+    return ""
+
+
+# ─── Groq & Excel ────────────────────────────────────────────────────────────
+
 def groq_ile_cikart(metin: str, istek: str, api_key: str) -> dict:
-    """Groq API ile Word metninden istenen veriyi JSON olarak çıkarır."""
     client = Groq(api_key=api_key)
-
-    sistem_mesaji = """Sen bir veri çıkarma asistanısın. Kullanıcının verdiği metinden istenen bilgileri çıkarıp SADECE geçerli bir JSON nesnesi döndürürsün.
-
-JSON formatı şu şekilde olmalı:
-{
-  "basliklar": ["Sütun1", "Sütun2", ...],
-  "satirlar": [
-    ["değer1", "değer2", ...],
-    ...
-  ]
-}
-
-Kurallar:
-- Sadece JSON döndür, başka hiçbir şey yazma
-- Türkçe karakterleri koru
-- Veri bulunamazsa boş liste döndür: {"basliklar": [], "satirlar": []}
-- Her satır aynı sayıda sütun içermeli"""
-
-    kullanici_mesaji = f"""Aşağıdaki Word belgesi metninden şu bilgileri çıkar: {istek}
-
-METIN:
-{metin[:8000]}"""
+    sistem = """Sen bir veri çıkarma asistanısın. Metinden istenen bilgileri çıkarıp SADECE geçerli JSON döndür.
+Format: {"basliklar": ["Sütun1", ...], "satirlar": [["değer1", ...], ...]}
+Kural: Sadece JSON, Türkçe karakterleri koru, veri yoksa boş liste döndür."""
 
     yanit = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
-            {"role": "system", "content": sistem_mesaji},
-            {"role": "user", "content": kullanici_mesaji}
+            {"role": "system", "content": sistem},
+            {"role": "user", "content": f"Şu bilgileri çıkar: {istek}\n\nMETİN:\n{metin[:8000]}"}
         ],
         temperature=0.1,
         max_tokens=4000
     )
-
-    ham_yanit = yanit.choices[0].message.content.strip()
-
-    # JSON bloğunu temizle
-    ham_yanit = re.sub(r'^```json\s*', '', ham_yanit)
-    ham_yanit = re.sub(r'\s*```$', '', ham_yanit)
-
-    return json.loads(ham_yanit)
+    ham = yanit.choices[0].message.content.strip()
+    ham = re.sub(r'^```json\s*', '', ham)
+    ham = re.sub(r'\s*```$', '', ham)
+    return json.loads(ham)
 
 
 def excel_olustur(veri: dict, cikti_yolu: str):
-    """Çıkarılan veriyi güzel formatlanmış bir Excel dosyasına yazar."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Çıkarılan Veri"
 
-    # Stil tanımları
     baslik_font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
     baslik_fill = PatternFill("solid", start_color="2E75B6")
     baslik_hizalama = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
     veri_font = Font(name="Arial", size=10)
-    cift_satir_fill = PatternFill("solid", start_color="D6E4F0")
-    tek_satir_fill = PatternFill("solid", start_color="FFFFFF")
+    cift_fill = PatternFill("solid", start_color="D6E4F0")
+    tek_fill = PatternFill("solid", start_color="FFFFFF")
     veri_hizalama = Alignment(vertical="center", wrap_text=True)
-
-    ince_sinir = Side(style="thin", color="BDD7EE")
-    sinir = Border(left=ince_sinir, right=ince_sinir, top=ince_sinir, bottom=ince_sinir)
+    ince = Side(style="thin", color="BDD7EE")
+    sinir = Border(left=ince, right=ince, top=ince, bottom=ince)
 
     basliklar = veri.get("basliklar", [])
     satirlar = veri.get("satirlar", [])
@@ -104,31 +107,27 @@ def excel_olustur(veri: dict, cikti_yolu: str):
     if not basliklar:
         ws["A1"] = "Veri bulunamadı."
         wb.save(cikti_yolu)
-        return
+        return 0, 0
 
-    # Başlık satırı
-    for col_idx, baslik in enumerate(basliklar, start=1):
-        hucre = ws.cell(row=1, column=col_idx, value=baslik)
-        hucre.font = baslik_font
-        hucre.fill = baslik_fill
-        hucre.alignment = baslik_hizalama
-        hucre.border = sinir
-
+    for col_idx, baslik in enumerate(basliklar, 1):
+        h = ws.cell(row=1, column=col_idx, value=baslik)
+        h.font = baslik_font
+        h.fill = baslik_fill
+        h.alignment = baslik_hizalama
+        h.border = sinir
     ws.row_dimensions[1].height = 30
 
-    # Veri satırları
-    for row_idx, satir in enumerate(satirlar, start=2):
-        fill = cift_satir_fill if row_idx % 2 == 0 else tek_satir_fill
-        for col_idx, deger in enumerate(satir, start=1):
-            hucre = ws.cell(row=row_idx, column=col_idx, value=deger)
-            hucre.font = veri_font
-            hucre.fill = fill
-            hucre.alignment = veri_hizalama
-            hucre.border = sinir
+    for row_idx, satir in enumerate(satirlar, 2):
+        fill = cift_fill if row_idx % 2 == 0 else tek_fill
+        for col_idx, deger in enumerate(satir, 1):
+            h = ws.cell(row=row_idx, column=col_idx, value=deger)
+            h.font = veri_font
+            h.fill = fill
+            h.alignment = veri_hizalama
+            h.border = sinir
         ws.row_dimensions[row_idx].height = 20
 
-    # Sütun genişliklerini otomatik ayarla
-    for col_idx, baslik in enumerate(basliklar, start=1):
+    for col_idx, baslik in enumerate(basliklar, 1):
         col_letter = openpyxl.utils.get_column_letter(col_idx)
         max_uzunluk = len(str(baslik))
         for satir in satirlar:
@@ -136,10 +135,8 @@ def excel_olustur(veri: dict, cikti_yolu: str):
                 max_uzunluk = max(max_uzunluk, len(str(satir[col_idx - 1])))
         ws.column_dimensions[col_letter].width = min(max_uzunluk + 4, 50)
 
-    # Başlık satırını dondur
     ws.freeze_panes = "A2"
 
-    # Özet bilgi
     ws_ozet = wb.create_sheet("Özet")
     ws_ozet["A1"] = "Toplam Satır:"
     ws_ozet["B1"] = len(satirlar)
@@ -149,50 +146,252 @@ def excel_olustur(veri: dict, cikti_yolu: str):
         ws_ozet[hucre].font = Font(name="Arial", bold=True)
 
     wb.save(cikti_yolu)
-    print(f"✅ Excel dosyası oluşturuldu: {cikti_yolu}")
-    print(f"   📊 {len(satirlar)} satır, {len(basliklar)} sütun")
+    return len(satirlar), len(basliklar)
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Word dosyasından AI ile veri çıkarıp Excel'e yazar",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Örnekler:
-  python main.py rapor.docx "kişi adları ve telefon numaraları" -k GROQ_API_KEY
-  python main.py fatura.docx "ürün adı, miktar, fiyat" -k GROQ_API_KEY -o fatura_data.xlsx
-        """
-    )
-    parser.add_argument("word_dosyasi", help="Kaynak Word (.docx) dosyasının yolu")
-    parser.add_argument("istek", help="Çıkartılacak verinin doğal dil açıklaması")
-    parser.add_argument("-k", "--api-key", required=True, help="Groq API anahtarı")
-    parser.add_argument("-o", "--cikti", help="Çıktı Excel dosyası adı (varsayılan: cikti.xlsx)")
+# ─── Watchdog Handler ─────────────────────────────────────────────────────────
 
-    args = parser.parse_args()
+class DosyaHandler(FileSystemEventHandler):
+    def __init__(self, uygulama):
+        self.uygulama = uygulama
+        self.islenen = set()
 
-    word_yolu = Path(args.word_dosyasi)
-    if not word_yolu.exists():
-        print(f"❌ Hata: '{word_yolu}' bulunamadı.")
-        sys.exit(1)
+    def on_created(self, event):
+        if event.is_directory:
+            return
+        yol = Path(event.src_path)
+        if yol.suffix.lower() in (".docx", ".pdf") and str(yol) not in self.islenen:
+            self.islenen.add(str(yol))
+            self.uygulama.dosya_isle(str(yol))
 
-    cikti_yolu = args.cikti or word_yolu.stem + "_cikti.xlsx"
 
-    print(f"📄 Word dosyası okunuyor: {word_yolu}")
-    metin = word_oku(str(word_yolu))
-    print(f"   {len(metin)} karakter okundu.")
+# ─── GUI ─────────────────────────────────────────────────────────────────────
 
-    print(f"🤖 Groq ile veri çıkarılıyor: '{args.istek}'")
-    veri = groq_ile_cikart(metin, args.istek, args.api_key)
+class Uygulama:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("📄➡️📊 Word/PDF → Excel Çıkarıcı")
+        self.root.geometry("700x600")
+        self.root.configure(bg="#1e1e2e")
+        self.root.resizable(True, True)
 
-    satirlar = veri.get("satirlar", [])
-    if not satirlar:
-        print("⚠️  Belirtilen kriterlere uygun veri bulunamadı.")
-    else:
-        print(f"   {len(satirlar)} kayıt bulundu.")
+        self.observer = None
+        self.izleniyor = False
 
-    print(f"📊 Excel oluşturuluyor: {cikti_yolu}")
-    excel_olustur(veri, cikti_yolu)
+        self._arayuz_olustur()
 
+    def _arayuz_olustur(self):
+        # Renkler
+        BG = "#1e1e2e"
+        SURFACE = "#2a2a3e"
+        ACCENT = "#7c6af7"
+        TEXT = "#e8e8f0"
+        MUTED = "#6b6b80"
+        GREEN = "#4ade80"
+        RED = "#f87171"
+
+        self.root.configure(bg=BG)
+
+        # Başlık
+        baslik = tk.Label(self.root, text="📄➡️📊 Word/PDF → Excel Çıkarıcı",
+                         font=("Segoe UI", 16, "bold"), bg=BG, fg=TEXT)
+        baslik.pack(pady=(20, 5))
+
+        alt = tk.Label(self.root, text="Klasörü izle, dosya gelince otomatik Excel üret",
+                      font=("Segoe UI", 10), bg=BG, fg=MUTED)
+        alt.pack(pady=(0, 15))
+
+        # Ana frame
+        ana = tk.Frame(self.root, bg=BG, padx=20)
+        ana.pack(fill="both", expand=True)
+
+        # API Key
+        tk.Label(ana, text="🔑 Groq API Anahtarı", font=("Segoe UI", 10, "bold"),
+                bg=BG, fg=TEXT).pack(anchor="w")
+        self.api_key = tk.Entry(ana, show="*", font=("Segoe UI", 10),
+                               bg=SURFACE, fg=TEXT, insertbackground=TEXT,
+                               relief="flat", bd=5)
+        self.api_key.pack(fill="x", pady=(3, 12))
+
+        # İzlenecek klasör
+        tk.Label(ana, text="📁 İzlenecek Klasör", font=("Segoe UI", 10, "bold"),
+                bg=BG, fg=TEXT).pack(anchor="w")
+        klasor_frame = tk.Frame(ana, bg=BG)
+        klasor_frame.pack(fill="x", pady=(3, 12))
+
+        self.klasor_yolu = tk.StringVar()
+        tk.Entry(klasor_frame, textvariable=self.klasor_yolu, font=("Segoe UI", 10),
+                bg=SURFACE, fg=TEXT, insertbackground=TEXT, relief="flat", bd=5).pack(
+                side="left", fill="x", expand=True)
+        tk.Button(klasor_frame, text="Seç", font=("Segoe UI", 9, "bold"),
+                 bg=ACCENT, fg="white", relief="flat", padx=10,
+                 command=self._klasor_sec).pack(side="right", padx=(8, 0))
+
+        # Veri isteği
+        tk.Label(ana, text="🤖 Ne çıkartılsın? (doğal dille yaz)",
+                font=("Segoe UI", 10, "bold"), bg=BG, fg=TEXT).pack(anchor="w")
+        self.istek = tk.Entry(ana, font=("Segoe UI", 10),
+                             bg=SURFACE, fg=TEXT, insertbackground=TEXT,
+                             relief="flat", bd=5)
+        self.istek.insert(0, "tüm veriler")
+        self.istek.pack(fill="x", pady=(3, 12))
+
+        # Butonlar
+        btn_frame = tk.Frame(ana, bg=BG)
+        btn_frame.pack(fill="x", pady=(5, 12))
+
+        self.btn_izle = tk.Button(btn_frame, text="▶ İzlemeyi Başlat",
+                                 font=("Segoe UI", 10, "bold"),
+                                 bg=GREEN, fg="#000", relief="flat", padx=15, pady=8,
+                                 command=self._izleme_toggle)
+        self.btn_izle.pack(side="left")
+
+        tk.Button(btn_frame, text="📂 Dosya Seç & İşle",
+                 font=("Segoe UI", 10, "bold"),
+                 bg=ACCENT, fg="white", relief="flat", padx=15, pady=8,
+                 command=self._manuel_isle).pack(side="left", padx=(10, 0))
+
+        tk.Button(btn_frame, text="🗑 Temizle",
+                 font=("Segoe UI", 10, "bold"),
+                 bg=SURFACE, fg=MUTED, relief="flat", padx=15, pady=8,
+                 command=self._log_temizle).pack(side="right")
+
+        # Durum
+        self.durum = tk.Label(ana, text="⏸ Bekleniyor",
+                             font=("Segoe UI", 10), bg=BG, fg=MUTED)
+        self.durum.pack(anchor="w")
+
+        # Log
+        tk.Label(ana, text="📋 İşlem Geçmişi", font=("Segoe UI", 10, "bold"),
+                bg=BG, fg=TEXT).pack(anchor="w", pady=(10, 3))
+        self.log = scrolledtext.ScrolledText(ana, height=12, font=("Consolas", 9),
+                                            bg=SURFACE, fg=TEXT, insertbackground=TEXT,
+                                            relief="flat", bd=5, state="disabled")
+        self.log.pack(fill="both", expand=True, pady=(0, 15))
+
+        # Renk etiketleri
+        self.log.tag_config("basari", foreground=GREEN)
+        self.log.tag_config("hata", foreground=RED)
+        self.log.tag_config("bilgi", foreground="#60a5fa")
+        self.log.tag_config("uyari", foreground="#fbbf24")
+
+        if not PDF_DESTEKLI:
+            self._log("⚠ PDF desteği için: pip install PyPDF2", "uyari")
+        self._log("Uygulama hazır. Klasör seçip izlemeyi başlatın.", "bilgi")
+
+    def _klasor_sec(self):
+        klasor = filedialog.askdirectory(title="İzlenecek klasörü seç")
+        if klasor:
+            self.klasor_yolu.set(klasor)
+            self._log(f"📁 Klasör seçildi: {klasor}", "bilgi")
+
+    def _izleme_toggle(self):
+        if not self.izleniyor:
+            self._izlemeyi_baslat()
+        else:
+            self._izlemeyi_durdur()
+
+    def _izlemeyi_baslat(self):
+        klasor = self.klasor_yolu.get()
+        api_key = self.api_key.get()
+
+        if not klasor:
+            messagebox.showwarning("Uyarı", "Lütfen bir klasör seçin!")
+            return
+        if not api_key:
+            messagebox.showwarning("Uyarı", "Lütfen API anahtarını girin!")
+            return
+
+        handler = DosyaHandler(self)
+        self.observer = Observer()
+        self.observer.schedule(handler, klasor, recursive=False)
+        self.observer.start()
+        self.izleniyor = True
+
+        self.btn_izle.config(text="⏹ İzlemeyi Durdur", bg="#f87171")
+        self.durum.config(text=f"🟢 İzleniyor: {klasor}", fg="#4ade80")
+        self._log(f"🟢 İzleme başladı: {klasor}", "basari")
+        self._log("📄 .docx veya .pdf dosyası atın, otomatik işlenecek!", "bilgi")
+
+    def _izlemeyi_durdur(self):
+        if self.observer:
+            self.observer.stop()
+            self.observer.join()
+            self.observer = None
+        self.izleniyor = False
+        self.btn_izle.config(text="▶ İzlemeyi Başlat", bg="#4ade80")
+        self.durum.config(text="⏸ Bekleniyor", fg="#6b6b80")
+        self._log("⏹ İzleme durduruldu.", "uyari")
+
+    def _manuel_isle(self):
+        dosyalar = filedialog.askopenfilenames(
+            title="Dosya seç",
+            filetypes=[("Word/PDF", "*.docx *.pdf"), ("Word", "*.docx"), ("PDF", "*.pdf")]
+        )
+        for dosya in dosyalar:
+            self.dosya_isle(dosya)
+
+    def dosya_isle(self, dosya_yolu: str):
+        def isle():
+            api_key = self.api_key.get()
+            istek = self.istek.get() or "tüm veriler"
+
+            if not api_key:
+                self._log("❌ API anahtarı eksik!", "hata")
+                return
+
+            yol = Path(dosya_yolu)
+            self._log(f"⏳ İşleniyor: {yol.name}", "bilgi")
+
+            try:
+                metin = dosya_oku(dosya_yolu)
+                if not metin:
+                    self._log(f"❌ Metin okunamadı: {yol.name}", "hata")
+                    return
+
+                self._log(f"   📖 {len(metin)} karakter okundu", "bilgi")
+                veri = groq_ile_cikart(metin, istek, api_key)
+
+                zaman = datetime.now().strftime("%H%M%S")
+                cikti = yol.parent / f"{yol.stem}_cikti_{zaman}.xlsx"
+                satirlar, sutunlar = excel_olustur(veri, str(cikti))
+
+                if satirlar == 0:
+                    self._log(f"⚠ Veri bulunamadı: {yol.name}", "uyari")
+                else:
+                    self._log(f"✅ {yol.name} → {cikti.name}", "basari")
+                    self._log(f"   📊 {satirlar} satır, {sutunlar} sütun", "basari")
+
+            except Exception as e:
+                self._log(f"❌ Hata: {e}", "hata")
+
+        threading.Thread(target=isle, daemon=True).start()
+
+    def _log(self, mesaj: str, tur: str = ""):
+        def yaz():
+            self.log.config(state="normal")
+            zaman = datetime.now().strftime("%H:%M:%S")
+            self.log.insert("end", f"[{zaman}] {mesaj}\n", tur)
+            self.log.see("end")
+            self.log.config(state="disabled")
+        self.root.after(0, yaz)
+
+    def _log_temizle(self):
+        self.log.config(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.config(state="disabled")
+
+    def kapat(self):
+        if self.observer:
+            self.observer.stop()
+            self.observer.join()
+        self.root.destroy()
+
+
+# ─── Başlat ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    app = Uygulama(root)
+    root.protocol("WM_DELETE_WINDOW", app.kapat)
+    root.mainloop()
